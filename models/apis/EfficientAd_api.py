@@ -77,7 +77,7 @@ datamodule = Folder(
 # ─── 3. Engine ───────────────────────────────────────────────────────────
 engine = Engine(
     default_root_dir="/content/anomaly_detect/models",
-    max_epochs=5,
+    max_epochs=20,
     accelerator="auto",
     devices=1,
     precision=16,
