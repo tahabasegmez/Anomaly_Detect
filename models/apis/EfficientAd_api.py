@@ -1,9 +1,11 @@
 import os
 import glob
+import re
 import numpy as np
 from sklearn.metrics import jaccard_score
 from PIL import Image
-
+import csv
+from datetime import datetime
 from anomalib.data import Folder
 from anomalib.models import EfficientAd
 from anomalib.engine import Engine
@@ -17,16 +19,6 @@ from anomalib.metrics import (
 from pytorch_lightning.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import Callback
 
-# ─── IoU hesaplayan fonksiyon ────────────────────────────────────────────
-def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray, threshold: float = 0.1) -> float:
-    pred_flat = (pred_mask > threshold).astype(np.uint8).flatten()
-    gt_flat   = (gt_mask > 0).astype(np.uint8).flatten()
-    if gt_flat.sum() == 0 and pred_flat.sum() == 0:
-        return 1.0
-    if gt_flat.sum() == 0 or pred_flat.sum() == 0:
-        return 0.0
-    return jaccard_score(gt_flat, pred_flat, zero_division=1)
-
 # ─── 1. PostProcessor ve Model ───────────────────────────────────────────
 post_processor = PostProcessor(image_sensitivity=0.5, pixel_sensitivity=0.5)
 
@@ -38,7 +30,6 @@ model = EfficientAd(
 )
 model.post_processor = post_processor
 
-# ✅ Metrikleri açık şekilde image & pixel olarak ayır
 val_metrics = [
     F1Max(fields=["pred_score", "gt_label"], prefix="image_"),
     AUROC(fields=["pred_score", "gt_label"], prefix="image_"),
@@ -53,7 +44,6 @@ test_metrics = [
 
 model.evaluator = Evaluator(val_metrics=val_metrics, test_metrics=test_metrics)
 
-# ✅ Epoch sonunda yazdıran callback
 class PrintMetricsCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         print("\n📢 Validation Metrics:")
@@ -68,7 +58,7 @@ logger = TensorBoardLogger("tb_logs", name="efficientad")
 # ─── 2. DataModule ───────────────────────────────────────────────────────
 datamodule = Folder(
     name="wood_dataset",
-    root="/content/drive/MyDrive/datasets/wood",
+    root="/content/anomaly_detect/datasets/wood_dataset",
     normal_dir="train/good",
     abnormal_dir="test/defect",
     normal_test_dir="test/good",
@@ -84,10 +74,10 @@ datamodule = Folder(
     seed=None,
 )
 
-# ─── 3. Engine (Trainer Wrapper) ────────────────────────────────────────
+# ─── 3. Engine ───────────────────────────────────────────────────────────
 engine = Engine(
     default_root_dir="/content/anomaly_detect/models",
-    max_epochs=20,
+    max_epochs=5,
     accelerator="auto",
     devices=1,
     precision=16,
@@ -103,65 +93,56 @@ engine = Engine(
 engine.fit(model=model, datamodule=datamodule)
 engine.test(model=model, datamodule=datamodule)
 
-# ✅ Test metriklerini ayrı ve son olarak yazdır
+model_name = "EfficientAD"
 
 print("\n📊 Final Test Metrics (from callback logs):")
+
+# Tarih ve saat bilgisi
+timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Metrikleri dict olarak topla
+metric_dict = {}
 for name, value in engine.trainer.callback_metrics.items():
     if isinstance(value, (float, int)) or (hasattr(value, 'item') and callable(value.item)):
-        print(f"  {name}: {value.item():.4f}")
+        val = value.item()
+        print(f"  {name}: {val:.4f}")
+        metric_dict[name] = val
 
-# ─── 5. Predict & IoU Hesaplama ─────────────────────────────────────────
+# Pixel F1'den tahmini IoU hesapla (IoU = F1 / (2 - F1))
+estimated_iou = None
+if "pixel_F1Score" in metric_dict:
+    pixel_f1 = metric_dict["pixel_F1Score"]
+    estimated_iou = pixel_f1 / (2 - pixel_f1)
+    metric_dict["Estimated_IoU"] = estimated_iou
+    print(f"  Estimated_IoU (from pixel_F1Score): {estimated_iou:.4f}")
+
+# CSV dosyasının tam yolu
+csv_path = "/content/anomaly_detect/models/Model_Metrics.csv"
+
+# Eğer dosya yoksa başlık yaz (header control)
+write_header = not os.path.exists(csv_path)
+
+with open(csv_path, mode="a", newline="") as f:
+    writer = csv.writer(f)
+
+    if write_header:
+        headers = ["Model", "Timestamp"] + list(metric_dict.keys())
+        writer.writerow(headers)
+
+    row = [model_name, timestamp] + [metric_dict.get(m, "") for m in metric_dict.keys()]
+    writer.writerow(row)
+
+print(f"\n📁 Test metrikleri şu dosyaya eklendi: {csv_path}")
+
+print(f"\n📁 Test metrikleri şu dosyaya eklendi: {csv_path}")
+# ─── 5. Predict & Gerçek IoU Hesaplama ──────────────────────────────────
 results = engine.predict(model=model, datamodule=datamodule)
-print(f"\nToplam tahmin edilen görüntü sayısı: {len(results)}")
 
-ious = []
-skipped_no_mask = 0
-skipped_good = 0
-skipped_shape = 0
+# ─── 7. Pixel-F1 → IoU Tahmini (Regex ile log'dan) ──────────────────────
+pixel_f1_value = metric_dict.get("pixel_F1Score", None)
 
-for result in results:
-    img_path = result.image_path[0]
-
-    if "/test/good/" in img_path:
-        skipped_good += 1
-        continue
-
-    pred_mask = result.anomaly_map[0].detach().cpu().numpy()
-    filename = os.path.basename(img_path)
-    mask_filename = filename.replace(".jpg", "_mask.jpg")
-
-    mask_pattern = os.path.join(
-        "/content/drive/MyDrive/datasets/wood",
-        "ground_truth/defect", "**", mask_filename
-    )
-    matches = glob.glob(mask_pattern, recursive=True)
-
-    if not matches:
-        print(f"GT mask bulunamadı: {mask_pattern}")
-        skipped_no_mask += 1
-        continue
-
-    gt_path = matches[0]
-    gt_mask = np.array(Image.open(gt_path).convert("L"))
-
-    if pred_mask.shape != gt_mask.shape:
-        print(f"Boyut uyumsuzluğu: pred {pred_mask.shape}, gt {gt_mask.shape}")
-        skipped_shape += 1
-        continue
-
-    iou = compute_iou(pred_mask, gt_mask, threshold=0.1)
-    print(f"{filename} → IoU: {iou:.4f}")
-    ious.append(iou)
-
-# ─── 6. Sonuç Özeti ──────────────────────────────────────────────────────
-print(f"\n🧾 Özet:")
-print(f"  Toplam tahmin edilen örnek      : {len(results)}")
-print(f"  Atlanan good sınıfı görüntüler  : {skipped_good}")
-print(f"  Eksik GT mask nedeniyle atlanan : {skipped_no_mask}")
-print(f"  Boyut uyumsuzluğu nedeniyle atla: {skipped_shape}")
-print(f"  IoU hesaplanan görüntü sayısı   : {len(ious)}")
-
-if ious:
-    print(f"\n✅ Ortalama IoU: {np.mean(ious):.4f}")
+if pixel_f1_value is not None:
+    iou_est = pixel_f1_value / (2 - pixel_f1_value)
+    print(f"\n🔁 Tahmini IoU (Pixel-F1'den): {iou_est:.4f} (Pixel F1: {pixel_f1_value:.4f})")
 else:
-    print("\n⚠️  Hiçbir defect görüntüsü için IoU hesaplanamadı!")
+    print("\n⚠️ pixel_F1Score değeri bulunamadı, tahmini IoU hesaplanamadı.")
